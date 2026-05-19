@@ -1,8 +1,8 @@
 /**
- * LayerNorm - Standard Layer Normalization
- * y = (x - mean) / sqrt(var + eps) * weight + bias
+ * RMSNorm (Root Mean Square Normalization)
+ * y = x * weight / sqrt(mean(x^2) + eps)
  *
- * Includes fused forward kernel and backward pass
+ * Used in LLaMA, Qwen, and other modern LLMs as a simpler alternative to LayerNorm
  */
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -20,171 +20,159 @@
         }                                                                      \
     } while (0)
 
+// Warp-level reduction
 __device__ float warp_reduce_sum(float val) {
+    #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
         val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
     return val;
 }
 
+// Block-level reduction using shared memory
 __device__ float block_reduce_sum(float val) {
     __shared__ float shared[32];
     int lane = threadIdx.x % 32;
     int wid = threadIdx.x / 32;
+
     val = warp_reduce_sum(val);
     if (lane == 0) shared[wid] = val;
     __syncthreads();
+
     val = (threadIdx.x < blockDim.x / 32) ? shared[lane] : 0.0f;
     if (wid == 0) val = warp_reduce_sum(val);
     return val;
 }
 
-// ========== LayerNorm Forward (Welford's online algorithm) ==========
-__global__ void layernorm_forward_kernel(
+// ========== RMSNorm Forward ==========
+// x: [batch, hidden_size], weight: [hidden_size], y: [batch, hidden_size]
+__global__ void rmsnorm_forward_kernel(
     const float *__restrict__ x,
     const float *__restrict__ weight,
-    const float *__restrict__ bias,
     float *__restrict__ y,
-    float *__restrict__ mean_out,   // optional, for backward
-    float *__restrict__ rstd_out,   // optional, for backward
     int hidden_size, float eps) {
 
     int batch_idx = blockIdx.x;
     const float *x_row = x + (size_t)batch_idx * hidden_size;
     float *y_row = y + (size_t)batch_idx * hidden_size;
 
-    // Welford's online algorithm for numerical stability
-    float sum = 0.0f;
-    float sum_sq = 0.0f;
+    // Compute sum of squares
+    float ss = 0.0f;
     for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
         float val = x_row[i];
-        sum += val;
-        sum_sq += val * val;
+        ss += val * val;
     }
-    sum = block_reduce_sum(sum);
-    sum_sq = block_reduce_sum(sum_sq);
+    ss = block_reduce_sum(ss);
 
-    __shared__ float s_mean, s_rstd;
+    __shared__ float s_rms_inv;
     if (threadIdx.x == 0) {
-        float mean = sum / hidden_size;
-        float var = sum_sq / hidden_size - mean * mean;
-        s_mean = mean;
-        s_rstd = rsqrtf(var + eps);
-        if (mean_out) mean_out[batch_idx] = mean;
-        if (rstd_out) rstd_out[batch_idx] = s_rstd;
+        s_rms_inv = rsqrtf(ss / hidden_size + eps);
     }
     __syncthreads();
 
-    float mean = s_mean;
-    float rstd = s_rstd;
-
+    // Normalize and scale
     for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
-        float normalized = (x_row[i] - mean) * rstd;
-        y_row[i] = normalized * weight[i] + bias[i];
+        y_row[i] = x_row[i] * s_rms_inv * weight[i];
     }
 }
 
-// ========== LayerNorm Backward ==========
-__global__ void layernorm_backward_kernel(
+// ========== RMSNorm Backward ==========
+__global__ void rmsnorm_backward_kernel(
     const float *__restrict__ dy,
     const float *__restrict__ x,
     const float *__restrict__ weight,
-    const float *__restrict__ mean_buf,
-    const float *__restrict__ rstd_buf,
     float *__restrict__ dx,
     float *__restrict__ dweight,
-    float *__restrict__ dbias,
-    int hidden_size) {
+    int hidden_size, float eps) {
 
     int batch_idx = blockIdx.x;
     const float *dy_row = dy + (size_t)batch_idx * hidden_size;
     const float *x_row = x + (size_t)batch_idx * hidden_size;
     float *dx_row = dx + (size_t)batch_idx * hidden_size;
 
-    float mean = mean_buf[batch_idx];
-    float rstd = rstd_buf[batch_idx];
-
-    // Compute two reductions: sum(dy * w) and sum(dy * w * x_hat)
-    float sum1 = 0.0f, sum2 = 0.0f;
+    // Recompute RMS
+    float ss = 0.0f;
     for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
-        float x_hat = (x_row[i] - mean) * rstd;
-        sum1 += dy_row[i] * weight[i];
-        sum2 += dy_row[i] * weight[i] * x_hat;
+        float val = x_row[i];
+        ss += val * val;
     }
-    sum1 = block_reduce_sum(sum1);
-    sum2 = block_reduce_sum(sum2);
+    ss = block_reduce_sum(ss);
 
-    __shared__ float s_sum1, s_sum2;
-    if (threadIdx.x == 0) { s_sum1 = sum1; s_sum2 = sum2; }
+    __shared__ float s_rms_inv;
+    if (threadIdx.x == 0) {
+        s_rms_inv = rsqrtf(ss / hidden_size + eps);
+    }
     __syncthreads();
 
-    float c1 = s_sum1 / hidden_size;
-    float c2 = s_sum2 / hidden_size;
+    float rms_inv = s_rms_inv;
 
+    // Compute inner product: sum(dy * x * weight)
+    float dot_val = 0.0f;
     for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
-        float x_hat = (x_row[i] - mean) * rstd;
-        dx_row[i] = rstd * (dy_row[i] * weight[i] - c1 - x_hat * c2);
-        atomicAdd(&dweight[i], dy_row[i] * x_hat);
-        atomicAdd(&dbias[i], dy_row[i]);
+        dot_val += dy_row[i] * x_row[i] * weight[i];
+    }
+    dot_val = block_reduce_sum(dot_val);
+
+    __shared__ float s_dot;
+    if (threadIdx.x == 0) s_dot = dot_val;
+    __syncthreads();
+
+    // dx = rms_inv * (dy * weight - x * dot / (ss + eps * hidden_size))
+    float scale = s_dot * rms_inv * rms_inv * rms_inv / hidden_size;
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        dx_row[i] = rms_inv * (dy_row[i] * weight[i] - x_row[i] * scale);
+        // Accumulate dweight (using atomics across batches)
+        atomicAdd(&dweight[i], dy_row[i] * x_row[i] * rms_inv);
     }
 }
 
 // Host wrappers
-void layernorm_forward(const float *x, const float *weight, const float *bias,
-                        float *y, float *mean_buf, float *rstd_buf,
-                        int batch, int hidden, float eps = 1e-5f) {
-    int threads = min(1024, hidden);
-    layernorm_forward_kernel<<<batch, threads>>>(x, weight, bias, y, mean_buf, rstd_buf, hidden, eps);
+void rmsnorm_forward(const float *x, const float *weight, float *y,
+                      int batch, int hidden_size, float eps = 1e-6f) {
+    int threads = min(1024, hidden_size);
+    rmsnorm_forward_kernel<<<batch, threads>>>(x, weight, y, hidden_size, eps);
+}
+
+void rmsnorm_backward(const float *dy, const float *x, const float *weight,
+                       float *dx, float *dweight,
+                       int batch, int hidden_size, float eps = 1e-6f) {
+    int threads = min(1024, hidden_size);
+    rmsnorm_backward_kernel<<<batch, threads>>>(dy, x, weight, dx, dweight, hidden_size, eps);
 }
 
 // ---- Test ----
 int main() {
     int batch = 32, hidden = 4096;
-    printf("LayerNorm: batch=%d, hidden=%d\n", batch, hidden);
+    printf("RMSNorm: batch=%d, hidden=%d\n", batch, hidden);
 
     size_t xSize = (size_t)batch * hidden * sizeof(float);
     size_t wSize = hidden * sizeof(float);
 
     float *hx = (float *)malloc(xSize);
     float *hw = (float *)malloc(wSize);
-    float *hb = (float *)malloc(wSize);
     float *hy = (float *)malloc(xSize);
     float *hy_ref = (float *)malloc(xSize);
 
     srand(42);
     for (int i = 0; i < batch * hidden; i++) hx[i] = ((float)(rand() % 200) - 100) / 100.0f;
-    for (int i = 0; i < hidden; i++) {
-        hw[i] = 1.0f + ((float)(rand() % 20) - 10) / 100.0f;
-        hb[i] = ((float)(rand() % 20) - 10) / 100.0f;
-    }
+    for (int i = 0; i < hidden; i++) hw[i] = 1.0f + ((float)(rand() % 20) - 10) / 100.0f;
 
-    // CPU reference
+    // Reference CPU
     for (int b = 0; b < batch; b++) {
-        float mean = 0, var = 0;
-        for (int i = 0; i < hidden; i++) mean += hx[b * hidden + i];
-        mean /= hidden;
-        for (int i = 0; i < hidden; i++) {
-            float d = hx[b * hidden + i] - mean;
-            var += d * d;
-        }
-        var /= hidden;
-        float rstd = 1.0f / sqrtf(var + 1e-5f);
+        float ss = 0;
+        for (int i = 0; i < hidden; i++) ss += hx[b * hidden + i] * hx[b * hidden + i];
+        float rms_inv = 1.0f / sqrtf(ss / hidden + 1e-6f);
         for (int i = 0; i < hidden; i++)
-            hy_ref[b * hidden + i] = (hx[b * hidden + i] - mean) * rstd * hw[i] + hb[i];
+            hy_ref[b * hidden + i] = hx[b * hidden + i] * rms_inv * hw[i];
     }
 
-    float *dx, *dw, *db, *dy, *d_mean, *d_rstd;
+    float *dx, *dw, *dy;
     CHECK_CUDA(cudaMalloc(&dx, xSize));
     CHECK_CUDA(cudaMalloc(&dw, wSize));
-    CHECK_CUDA(cudaMalloc(&db, wSize));
     CHECK_CUDA(cudaMalloc(&dy, xSize));
-    CHECK_CUDA(cudaMalloc(&d_mean, batch * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_rstd, batch * sizeof(float)));
-
     CHECK_CUDA(cudaMemcpy(dx, hx, xSize, cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(dw, hw, wSize, cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(db, hb, wSize, cudaMemcpyHostToDevice));
 
-    layernorm_forward(dx, dw, db, dy, d_mean, d_rstd, batch, hidden);
+    rmsnorm_forward(dx, dw, dy, batch, hidden);
     CHECK_CUDA(cudaDeviceSynchronize());
     CHECK_CUDA(cudaMemcpy(hy, dy, xSize, cudaMemcpyDeviceToHost));
 
@@ -201,17 +189,16 @@ int main() {
     CHECK_CUDA(cudaEventCreate(&stop));
     int nIter = 100;
     CHECK_CUDA(cudaEventRecord(start));
-    for (int i = 0; i < nIter; i++) layernorm_forward(dx, dw, db, dy, d_mean, d_rstd, batch, hidden);
+    for (int i = 0; i < nIter; i++) rmsnorm_forward(dx, dw, dy, batch, hidden);
     CHECK_CUDA(cudaEventRecord(stop));
     CHECK_CUDA(cudaEventSynchronize(stop));
     float ms;
     CHECK_CUDA(cudaEventElapsedTime(&ms, start, stop));
     ms /= nIter;
-    double gbps = 3.0 * batch * hidden * sizeof(float) / (ms * 1e-3) / 1e9;
+    double gbps = 2.0 * batch * hidden * sizeof(float) / (ms * 1e-3) / 1e9;
     printf("Avg time: %.4f ms | %.2f GB/s\n", ms, gbps);
 
-    cudaFree(dx); cudaFree(dw); cudaFree(db); cudaFree(dy);
-    cudaFree(d_mean); cudaFree(d_rstd);
-    free(hx); free(hw); free(hb); free(hy); free(hy_ref);
+    cudaFree(dx); cudaFree(dw); cudaFree(dy);
+    free(hx); free(hw); free(hy); free(hy_ref);
     return 0;
 }
