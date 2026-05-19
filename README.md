@@ -9,7 +9,7 @@ High-performance CUDA kernels for modern Transformer architectures, implemented 
 
 ```bash
 # Run all tests (one-click)
-cd /root/CUDA/Transformer
+cd DSL_Tool
 bash run_all_tests.sh
 
 # Or selectively:
@@ -64,7 +64,7 @@ print(result.to_dict())
 Start service:
 
 ```bash
-cd /root/CUDA/Transformer
+cd DSL_Tool
 uvicorn dispatcher.api:app --host 0.0.0.0 --port 8000 --reload
 ```
 
@@ -93,7 +93,7 @@ curl -X POST http://127.0.0.1:8000/api/v1/kernels/run \
 ### CLI
 
 ```bash
-cd /root/CUDA/Transformer
+cd cd DSL_Tool
 
 # List all registered kernels
 python -m dispatcher.cli list
